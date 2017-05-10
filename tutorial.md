@@ -57,10 +57,9 @@ enable U2F is a little bit trickier. We first declare a ````deviceRegistrationSc
 schema with the properties need to work with the U2F API, then use this new schema within
 the ````UserSchema```` schema.
 
-The values we care about now are the ````name````, ````email````, ````username````,
-````hashed_password```` and ````salt```` fields. These are the values that we fill upon
-the first step of registration. Lets talk about how to complete the User Model before getting
-into form submission.
+The values we care about now are the ````name````, ````email````, ````username````,````hashed_password```` and ````salt```` fields.
+These are the values that we fill upon the first step of registration. Lets talk about how to
+complete the User Model before getting into form submission.
 
 Mongoose requires that we have validations for certain values, to ensure that only valid values
 are inserted into the database. Our validations simply check that no fields are blank, and that
@@ -172,3 +171,396 @@ brute force attacks as well as to prevent cracking passwords if an attacker gets
 user database.
 
 TODO: explain relevant methods in controllers/users.js and routing
+
+### Routing and Controllers
+
+There are a few changes that we need to make to our sites routing in order to ensure that
+certain pages are only available when a user is authenticated, as well as set up our
+registration and login flow. If you are new to Express, all of our routing is handled
+by ````config/routes.js````. In our example project, we handle all of the actual methods
+called by the routing in a separate ````controllers```` directory, which we will go over next.
+
+The following code is the routing we need for now, we will add more routes to support U2F
+later.
+
+````javascript
+/*
+ * Module dependencies.
+ */
+
+const users = require('../app/controllers/users');
+const home = require('../app/controllers/home');
+const auth = require('./middlewares/authorization');
+
+
+const fail = {
+  failureRedirect: '/login'
+};
+
+/**
+ * Expose routes
+ */
+
+ module.exports = function (app, passport) {
+   const pauth = passport.authenticate.bind(passport);
+
+   // user routes
+   app.get('/login', users.login);
+   app.get('/signup', users.signup);
+   app.get('/logout', users.logout);
+   app.post('/users', users.create);
+   app.post('/users/session',
+     pauth('local', {
+       failureRedirect: '/login',
+       failureFlash: 'Invalid email or password.'
+     }), users.session);
+
+   app.param('userId', users.load);
+
+   app.get('/', home.index);
+
+   // see source for error handling
+
+ };
+````
+Using a separate Controllers file leads to a simple routing method. GET and POST requests are
+directed to the proper Javascript methods. For example, when we receive a HTTP GET request
+for ````'/login'```` we call the ````login```` method of our ````users```` controller.
+Let's take a look at the methods that our routing
+calls on, located within the ````app/controllers/users.js```` file.
+
+````javascript
+/**
+ * Load
+ */
+
+exports.load = async(function* (req, res, next, _id) {
+  const criteria = { _id };
+  try {
+    req.profile = yield User.load({ criteria });
+    if (!req.profile) return next(new Error('User not found'));
+  } catch (err) {
+    return next(err);
+  }
+  next();
+});
+
+/**
+ * Create user
+ */
+
+exports.create = async(function* (req, res) {
+  const user = new User(req.body);
+  user.provider = 'local';
+  try {
+    yield user.save();
+    req.logIn(user, err => {
+      if (err) req.flash('info', 'Sorry! We are not able to log you in!');
+      // used to direct to /, we changed it
+      return res.redirect('/setup2fa');
+    });
+  } catch (err) {
+    const errors = Object.keys(err.errors)
+      .map(field => err.errors[field].message);
+
+    res.render('users/signup', {
+      title: 'Sign up',
+      errors,
+      user
+    });
+  }
+});
+
+/**
+ *  Show profile
+ */
+
+exports.show = function (req, res) {
+  const user = req.profile;
+  respond(res, 'users/show', {
+    title: user.name,
+    user: user
+  });
+};
+
+exports.signin = function () {};
+
+/**
+ * Auth callback
+ */
+
+exports.authCallback = login;
+
+/**
+ * Show login form
+ */
+
+exports.login = function (req, res) {
+  res.render('users/login', {
+    title: 'Login'
+  });
+};
+
+/**
+ * Show sign up form
+ */
+
+exports.signup = function (req, res) {
+  res.render('users/signup', {
+    title: 'Sign up',
+    user: new User()
+  });
+};
+
+/**
+ * Logout
+ */
+
+exports.logout = function (req, res) {
+  req.logout();
+  req.session.secondFactor = undefined;
+  res.redirect('/login');
+};
+
+/**
+ * Session
+ */
+
+exports.session = login;
+
+/**
+ * Login
+ */
+
+ function login (req, res) {
+  res.redirect('/2faCheck');
+}
+````
+Most of these methods just told the site to render certain views for the user, but a few of
+them handle some more complex tasks like creating and loading users. We will add more complex
+methods in order to handle U2F in future steps.
+
+Note that the login function redirects us to the ````2faCheck```` page, which we don't have
+have a route for yet. We will add those routes in the U2F section. We want our users to be
+directed to this page after they login so that they can finish the login process by providing
+their U2F device.
+
+### Views
+
+Most of the methods we have in the ````app/controllers/users.js```` file use the ````res.render()```` function to direct users to pages. We will go over the login and signup
+pages here.
+
+Our project uses Jade as the rendering language, which is compiled to HTML. This was a result
+of piggybacking off of (TODO insert boilerplate github project here).
+
+Our views both extend ````auth```` which is some simple boilerplate stuff for maintaining the
+overall feel of the site. I will just go over the important parts here. ````app/views/users/signup.jade````:
+
+````
+extends auth
+
+block auth
+  form.form-horizontal.form-signin(action="/users", method="post", role="form")
+    input(type='hidden', name='_csrf', value="#{csrf_token}")
+
+    input#email.form-control(type='text', name="email", placeholder='Email', value=user.email)
+
+    input#name.form-control(type='text', name="name", placeholder='Full name', value=user.name)
+
+    input#username.form-control(type='text', name="username", placeholder='Username', value=user.username)
+
+    input#password.form-control(type='password', name="password", placeholder='Password')
+
+    br
+    .text-center
+      button.btn.btn-primary(type='submit') Sign up
+      br
+      br
+      a.show-login(href="/login") Log in
+````
+Upon submit, all of these values are saved in the request (````req````) which we can access
+to create a ````User```` with these values. This is why it is absolutely critical that the
+site be configured with SSL properly. Without SSL, the values entered into these fields (on
+both the signup page and the login page) can be captured with a Man-in-the-Middle attack.
+
+Also note the ````_csrf```` form on the page. This is protection against Cross Site Request
+Forgery (CSRF). We use the csurf package to prevent CSRF on our site, which simplifies the
+process of having hidden nonces on forms that ensure the forms we are receiving are valid.
+
+Our login page is even simpler. Note the use of the CSRF token as well as the location of
+an error message to appear if, for example, the password is incorrect. ````app/views/users/login.jade````:
+````
+extends auth
+
+block auth
+  form.form-horizontal.form-signin(action="/users/session", method="post", role="form")
+    input(type="hidden", name="_csrf", value="#{csrf_token}")
+
+    p.col-sm-offset-2.error= message
+
+    input#email.form-control(type="email", placeholder="Email", name="email")
+
+    input#password.form-control(type="password", placeholder="Password", name="password")
+
+    br
+    button.btn.btn-primary.btn-block(type="submit") Log in
+    br
+
+    .text-center
+      a.show-signup(href="/signup") Sign up
+````
+Now we are ready to add U2F to our site.
+
+TODO add contents of config/passport/local.js
+
+## U2F with yubikey
+
+This section details how to add support for FIDO U2F to your Express site. We tested our
+site with Yubico Yubikeys. We make use of the Google implementation of the official U2F
+API. Note that Chrome is currently the only browser that supports FIDO U2F without a plugin
+or extension.
+
+### Routing and Controllers
+
+We need to add the following lines to our ````config/routes.js```` file with the rest of our
+get and post methods. Note that our example site file can be seen in it's entirety at (TODO
+INSERT LINK HERE).
+
+````javascript
+app.get('/u2f-api.js', users.api);
+app.get('/2faCheck', auth.requiresLogin, users.twofacheck);
+app.get('/setup2FA', users.setup2fa);
+app.get('/registerU2F', auth.requiresLogin, users.registerGet);
+app.post('/registerU2F', auth.requiresLogin, users.registerPost);
+app.get('/authenticateU2F', auth.requiresLogin, users.authenticateGet);
+app.post('/authenticateU2F', auth.requiresLogin, users.authenticatePost);
+
+app.get('/users/:userId', auth.requires2FA, users.show);
+````
+These additional lines handle the GET and POST requests we need in order to add U2F. We can
+recognize the familiar calls to our user controller, but many of these new routes also
+have the ````auth.requiresLogin```` flag as well. This is to ensure that we users can only
+reach this page if they have already authenticated themselves. This is important because
+we have to know which user is trying to provide their second factor.
+
+The ````app.get('/users/:userId', auth.requires2FA, users.show);```` line is the secret
+page that only authenticated users are able to see. It uses the ````auth.requires2FA```` flag,
+which is only true when the user has already authenticated themselves with their password as
+well as U2F.
+
+This properties are set up in the ````config/middlewares/authorization.js```` file:
+
+````javascript
+exports.requiresLogin = function (req, res, next) {
+  if (req.isAuthenticated()) return next();
+  if (req.method == 'GET') req.session.returnTo = req.originalUrl;
+  res.redirect('/login');
+};
+
+exports.requires2FA = function (req, res, next) {
+  if (req.isAuthenticated() && req.session.secondFactor) return next();
+  if (req.method == 'GET') req.session.returnTo = req.originalUrl;
+  res.redirect('/login');
+};
+````
+
+It is worth noting that this simple set up does not differentiate between users. A more complex ````authorization.js```` is required for this to work.
+
+Now let's look at the new methods our user controller needs in order to serve these GET and
+POST requests. Once again these methods are all located in the ````app/controllers/users.js````
+file, and our example file can be viewed in it's entirety at the Github page.
+
+Firstly, we use the ````users.api```` function to give the user's browser access to Google's
+Javascript API which we leverage to handle registering and authenticating U2F tokens:
+
+````javascript
+exports.api = function (req, res) {
+  res.sendFile('u2f-api.js', {root: './scripts'});
+};
+````
+
+The next two functions are pretty simple, and are there to check that the user has
+authenticated with their password and to render the setup page for U2F:
+
+````javascript
+// check for auth then redirect to 2fa auth form
+exports.twofacheck = function (req, res) {
+  res.render('users/check2fa', {
+    title: '2FA'
+  });
+};
+
+// show setup 2fa form
+exports.setup2fa = function (req, res) {
+    res.render('users/setup2fa', {
+        title: 'Setup 2FA'
+  });
+};
+````
+
+Now we are on to the actual registration page. Note that ````'/registerU2F'```` has a
+controller for both GET and POST, ````users.registerGet```` and ````users.registerPost````:
+
+````javascript
+exports.registerGet = function (req, res) {
+  try {
+    var registerRequest = u2f.request(app_id);
+    req.session.registerRequest = registerRequest;
+    res.send(registerRequest);
+  } catch (err) {
+    console.log(err);
+    res.status(400).send();
+  }
+};
+
+exports.registerPost = function (req, res) {
+  var registerResponse = req.body;
+  var registerRequest = req.session.registerRequest;
+  var id = req.user.id;
+
+  try {
+    var registration = u2f.checkRegistration(registerRequest,registerResponse);
+
+    User.findById(id, function(err, user) {
+      if (err) throw err;
+
+      user.add2FA(registration, function(err, username) {
+        if (err) throw err;
+      });
+
+      user.save({ validateBeforeSave: false }, function(err) {
+        if (err) {
+          throw err;
+        }
+
+      });
+    });
+    res.send();
+  } catch (err) {
+    console.log(err);
+    res.status(400).send();
+  }
+};
+````
+
+The ````registerGet```` function is pretty simple, and simply provides the client side with
+the ````app_id````. This should be set as a ````const```` in your main Javascript file, eg ````server.js````.
+The ````app_id```` is simply the name of the site, which must be ````https```` in order for
+the U2F library to accept it.
+
+The ````registerPost```` function is slightly more complicated, because it handles the
+receiving of the data needed to register the U2F device, as well as validating it and
+adding it to the ````User```` schema. First, the request and response are parsed by the
+Google U2F library with ````u2f.checkRegistration````. Then we look up the corresponding
+user in our database, and call the ````add2FA```` function. This is a simple function which
+goes in our ````app/models/user.js```` file, under the ````UserSchema.methods````:
+
+````javascript
+add2FA: function (registration) {
+    this.deviceRegistration = registration;
+  }
+````
+
+Then we save the user. Note that we do this without validating, which is not recommended.
+
+TODO views and javascript within, conclusion  
