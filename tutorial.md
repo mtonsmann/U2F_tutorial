@@ -3,6 +3,7 @@
 ## Example Code
 A working example of the topics in this tutorial can be found at [this link](https://tonsmann.me)
 and all of the corresponding code this github repository:
+https://github.com/mtonsmann/FIDO-U2F-Express-Passport-Example
 
 
 ## Requirements
@@ -16,6 +17,14 @@ In this project we use the following:
 We assume that you already have a website with a SSL certificate. We will explain how to
 properly authenticate users using the Passport framework for local authentication, as well
 as add U2F using the FIDO U2F protocol.
+
+If you have not used Express and Passport before, [this project](https://github.com/madhums/node-express-mongoose/) provides an excellent
+starting point also has a wiki available [here](https://github.com/madhums/node-express-mongoose/wiki). This tutorial will use a
+similar layout to this project.
+
+The purpose of this tutorial is not to teach you the fundamentals of user authentication, but
+to teach you how to implement the best practices. There is a complex overview of the FIDO U2F
+protocol available [here](https://fidoalliance.org/).
 
 ## User authentication
 ### User Model
@@ -170,7 +179,6 @@ for speed. When it comes to hashing passwords, we want a slow hashing algorithm 
 brute force attacks as well as to prevent cracking passwords if an attacker gets ahold of our
 user database.
 
-TODO: explain relevant methods in controllers/users.js and routing
 
 ### Routing and Controllers
 
@@ -345,13 +353,57 @@ have a route for yet. We will add those routes in the U2F section. We want our u
 directed to this page after they login so that they can finish the login process by providing
 their U2F device.
 
+### Passport Configuration
+
+We just need to write one small function to finish up our username+password part of the
+authentication. This is the login logic that will call functions in our User model to
+authenticate users. This is part of Passport, so we will locate it at ````/config/passport/local.js````:
+
+````javascript
+/**
+ * Module dependencies.
+ */
+
+var mongoose = require('mongoose');
+var LocalStrategy = require('passport-local').Strategy;
+var User = mongoose.model('User');
+
+/**
+ * Expose
+ */
+
+module.exports = new LocalStrategy({
+    usernameField: 'email',
+    passwordField: 'password'
+  },
+  function (email, password, done) {
+    var options = {
+      criteria: { email: email }
+    };
+    User.load(options, function (err, user) {
+      if (err) return done(err);
+      if (!user) {
+        return done(null, false, { message: 'Unknown user' });
+      }
+      if (!user.authenticate(password)) {
+        return done(null, false, { message: 'Invalid password' });
+      }
+      return done(null, user);
+    });
+  }
+);
+````
+
+All this function does is say if a particular email and password combination is valid. Most
+of the work is done by the ````load```` function within our User model.
+
 ### Views
 
 Most of the methods we have in the ````app/controllers/users.js```` file use the ````res.render()```` function to direct users to pages. We will go over the login and signup
 pages here.
 
 Our project uses Jade as the rendering language, which is compiled to HTML. This was a result
-of piggybacking off of (TODO insert boilerplate github project here).
+of piggybacking off of https://github.com/madhums/node-express-mongoose/.
 
 Our views both extend ````auth```` which is some simple boilerplate stuff for maintaining the
 overall feel of the site. I will just go over the important parts here. ````app/views/users/signup.jade````:
@@ -411,7 +463,6 @@ block auth
 ````
 Now we are ready to add U2F to our site.
 
-TODO add contents of config/passport/local.js
 
 ## U2F with yubikey
 
@@ -423,8 +474,7 @@ or extension.
 ### Routing and Controllers
 
 We need to add the following lines to our ````config/routes.js```` file with the rest of our
-get and post methods. Note that our example site file can be seen in it's entirety at (TODO
-INSERT LINK HERE).
+get and post methods. Note that our example site file can be seen in it's entirety at https://github.com/mtonsmann/FIDO-U2F-Express-Passport-Example.
 
 ````javascript
 app.get('/u2f-api.js', users.api);
@@ -563,4 +613,231 @@ add2FA: function (registration) {
 
 Then we save the user. Note that we do this without validating, which is not recommended.
 
-TODO views and javascript within, conclusion  
+Now that we are able to register a U2F device to a user server-side, lets allow them to
+actually log in with it. We need to add the ````users.authenticateGet```` and ````users.authenticatePost````
+methods to the ````app/controllers/users.js````:
+
+````javascript
+exports.authenticateGet = function (req, res) {
+  User.findOne({username: req.user.username}, function(err, user){
+    if (err) {
+      res.status(400).send(err);
+    } else {
+      if (reg !== null) {
+        var signRequest = u2f.request(app_id, user.deviceRegistration.keyHandle);
+        req.session.signrequest = signRequest;
+        req.session.deviceRegistration = user.deviceRegistration;
+        res.send(signRequest);
+      }
+    }
+  });
+};
+
+exports.authenticatePost = function (req, res) {
+  var signResponse = req.body;
+  var signRequest = req.session.signrequest;
+  var deviceRegistration = req.session.deviceRegistration;
+  try {
+    var result = u2f.checkSignature(signRequest, signResponse, deviceRegistration.publicKey);
+    if (result.successful) {
+      req.session.secondFactor = 'u2f';
+      res.send();
+    } else {
+      res.status(400).send();
+    }
+  } catch (err) {
+    console.log(err);
+    res.status(400).send();
+  }
+};
+````
+
+Our ````authenticateGet```` function simply checks for the user in the database, and uses
+the stored ````deviceRegistration```` information to generate a ````signRequest```` with the
+Google U2F API. It then sends the ````signRequest```` back to the client in the response.
+
+Our ````authenticatePost```` function just uses the Google U2F library to check the signature
+response with the request and the user's stored public key in the database. If the check is
+successful then the session ````secondFactor```` flag is set, so we now know that the user has
+successfully authenticated with their U2F device.
+
+### Views
+
+Finally, let's go over the views that we need to add for U2F to work. Unlike our Jade files
+for password authentication, we need to use some client side Javascript to get retrieve the
+keys off of the U2F device.
+
+Here is the Jade portion of our ````setup2fa```` page located at ````app/views/users/setup2fa.jade````:
+
+````
+extends auth
+
+block auth
+
+  h1 2FA
+  input(type='hidden' id='csrftoken_' name='_csrf', value="#{csrf_token}")
+  p Welcome to the 2FA Demo. Now you get to set up the 2FA methods
+  p
+    | Once you have set your token sucessfully you can
+    a(href='/logout') logout
+    |  and then try and log back in
+  p
+  h2 Fido U2F
+  p Plug your token in and press the button below and follow the instructions
+  button#setupFido Fido U2F
+
+  div
+    h3 Console
+    div(id="workspace")
+
+  script(type='application/javascript').
+    // javascript goes here
+  script(src='u2f-api.js')
+````
+
+Note that we once again include the hidden CSRF field. This time we will handle sending
+that token directly within the embedded Javascript on the page. The Javascript that is
+embedded in this page is as follows:
+
+````javascript
+function clearWorkspace() {
+      var element = document.getElementById('workspace');
+      while (element.firstChild) {
+        element.removeChild(element.firstChild);
+      }
+    }
+
+    var xhr = new XMLHttpRequest();
+
+    var fidoButton = document.getElementById('setupFido');
+    fidoButton.onclick = function setupFido() {
+      clearWorkspace();
+      xhr.open('GET', '/registerU2F', true);
+      xhr.onreadystatechange = function () {
+        if(xhr.readyState == 4 && xhr.status == 200) {
+          var registerRequest = [JSON.parse(xhr.responseText)];
+          document.getElementById('workspace').innerHTML ="If your token has a button, press it when the light flashes";
+          u2f.register(registerRequest,[], function(data){
+            var xhr2 = new XMLHttpRequest();
+            xhr2.open('POST', '/registerU2F', true);
+            xhr2.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+            xhr2.onreadystatechange = function() {
+              if (xhr2.readyState == 4 && xhr2.status == 200) {
+                document.getElementById('workspace').innerHTML ="Fido U2F Token enabled";
+              } else if (xhr2.readyState == 4 && xhr2.status !== 200) {
+                document.getElementById('workspace').innerHTML ="error setting up Fido U2F token";
+              }
+            }
+            var csrftoken = document.getElementById('csrftoken_').value;
+            var jsonData = JSON.parse(JSON.stringify(data));
+            jsonData._csrf = csrftoken;
+
+            xhr2.send(JSON.stringify(jsonData));
+          });
+        }
+      };
+      xhr.send();
+    }
+  ````
+  It is important to note that indentation matters in Jade, so this javascript must be
+  indented so that is within the javascript block as well as within ````block auth````.
+  You can check the full example at the Github link provided.
+
+  The ````workspace```` referred to in this script is simply an area on the page that we can
+  change dynamically in order to update the user on the process of registering their token.
+  The next step is run once the user presses the button. It then sends a HTTP GET request to   ````/regisgterU2F```` (which we have already prepared for server side). This will respond
+  with the ````signRequest```` which we can then use to call the ````register()```` function
+  from the Google U2F API. The ````register()```` function requires the user to interact
+  with the U2F device, so we prompt the user to touch the device when it flashes. The script
+  then adds the ````csrftoken_```` to the data to be sent to the server and
+  sends a POST with the ````signResponse````. It will then tell the user if the registration
+  process was successful by checking the response status.
+
+  Now let's look at the similar ````check2fa.jade```` file and the accompanying Javascript:
+
+  ````
+  extends auth
+
+block auth
+  .text-center
+    h1 Connect your token provider, then press the button to continue
+    input(type='hidden' id='csrftoken_' name='_csrf', value="#{csrf_token}")
+
+    button#fidoButton FIDO U2F
+
+    div(id="fido")
+      p If the light flashes on your token please press the button
+  script(src='u2f-api.js', type='text/javascript')
+  script(type='text/javascript').
+    // insert javascript here
+  ````
+
+  ````javascript
+  var fidoButton = document.getElementById('fidoButton');
+    fidoButton.onclick = function() {
+      document.getElementById('fido').style.visibility = "visible";
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/authenticateU2F', true);
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState == 4 && xhr.status == 200) {
+        var signRequests = [JSON.parse(xhr.responseText)];
+        console.log(signRequests[0]);
+        try {
+          u2f.sign(signRequests,function(data){
+            if (!data.errorCode) {
+              var xhr2 = new XMLHttpRequest();
+              xhr2.open('POST', '/authenticateU2F', true);
+              xhr2.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+              xhr2.onreadystatechange = function() {
+                if (xhr2.readyState == 4 && xhr2.status == 200) {
+                  //redirect to /user
+                  window.location = '/';
+                } else if (xhr2.readyState == 4 && xhr2.status !== 200) {
+                  //redirect to /logout
+                  //window.location = '/logout';
+                  console.log("failed");
+                }
+              };
+              var csrftoken = document.getElementById('csrftoken_').value;
+              var jsonData = JSON.parse(JSON.stringify(data));
+              jsonData._csrf = csrftoken;
+
+              xhr2.send(JSON.stringify(jsonData));
+            } else {
+              document.getElementById('fido').innerHTML = "Token error: " + data.errorMessage;
+            }
+          },3000);
+        } catch (err) {
+          console.log("Catch err - " + err );
+        }
+      }
+    }
+    xhr.send();
+    }
+  ````
+
+  The Jade here is pretty similar and self explanatory. The Javascript will execute on button
+  click, and submits a GET request which will return the ````signRequest````. We can then use
+  the Google U2F library to generate the signature, which will once again require the user to
+  touch the device. Once we have generated the signature, we send it in the POST request
+  along with the CSRF token.
+
+  That covers all of the essentials! If you hare having trouble getting the full picture,
+  check out the Github page to see how all of the pieces fit together.
+
+## Notes
+
+This tutorial is a constant work in progress. We are aware that there are probably better
+ways to do things, and we encourage the community to help us make this tutorial as helpful
+as possible. If you know a way to do something better, or you see a vulnerability, please
+submit a pull request!
+
+## Credits
+
+The site this tutorial is based on is itself the product of following multiple tutorials and
+combining different pieces of code. I will try to list them here:
+* Boilerplate example code for an Express + Passport site: https://github.com/madhums/node-express-mongoose/
+  * accompanying tutorial https://github.com/madhums/node-express-mongoose/wiki
+  * full example: https://github.com/madhums/node-express-mongoose-demo/
+* Tutorial for using 2Factor with Express http://www.hardill.me.uk/wordpress/tag/passportjs/
+  * Example Code https://github.com/madhums/node-express-mongoose/
